@@ -219,3 +219,4 @@ outputs
 datasets
 attack/MMA-Diffusion
 attack/DiffSynth-Studio/models
+*.jpg
