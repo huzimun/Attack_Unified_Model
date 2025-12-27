@@ -15,3 +15,5 @@ Adversarial Attack for Unified Multimodal Understanding and  Generation Models
 
 ## Evaluation
 
+test
+git
