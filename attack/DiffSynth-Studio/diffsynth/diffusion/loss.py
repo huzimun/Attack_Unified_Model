@@ -33,6 +33,69 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
     return loss
 
 
+def FlowMatchTeacherLoss(pipe_student: BasePipeline, teacher_pipe: BasePipeline,
+                         inputs_shared_clean: dict, inputs_posi_clean: dict, inputs_nega_clean: dict,
+                         inputs_shared_trigger: dict, inputs_posi_trigger: dict, inputs_nega_trigger: dict,
+                         teacher_inputs: tuple = None,
+                         semantic_weight: float = 1.0, regularization_weight: float = 1.0,
+                         max_timestep_boundary_ratio: float = 1.0, min_timestep_boundary_ratio: float = 0.0):
+    """
+    Compute a FlowMatch-style teacher-student loss:
+    - semantic loss: MSE(noise_pred_student_on_trigger, noise_pred_teacher_on_clean)
+    - regularization loss: MSE(noise_pred_student_on_clean, noise_pred_teacher_on_clean)
+
+    Inputs are expected to contain keys such as "input_latents".
+    """
+    max_timestep_boundary = int(max_timestep_boundary_ratio * len(pipe_student.scheduler.timesteps))
+    min_timestep_boundary = int(min_timestep_boundary_ratio * len(pipe_student.scheduler.timesteps))
+
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    timestep_student = pipe_student.scheduler.timesteps[timestep_id].to(dtype=pipe_student.torch_dtype, device=pipe_student.device)
+
+    # sample noise on student device/dtype
+    noise = torch.randn_like(inputs_shared_clean["input_latents"]).to(device=pipe_student.device, dtype=pipe_student.torch_dtype)
+
+    # add noise to latents
+    inputs_shared_trigger = dict(inputs_shared_trigger)
+    inputs_shared_clean = dict(inputs_shared_clean)
+    inputs_shared_trigger["latents"] = pipe_student.scheduler.add_noise(inputs_shared_trigger["input_latents"], noise, timestep_student)
+    inputs_shared_clean["latents"] = pipe_student.scheduler.add_noise(inputs_shared_clean["input_latents"], noise, timestep_student)
+
+    # prepare teacher latents: use pre-run teacher_inputs if provided, otherwise convert from student inputs
+    noise_teacher = noise.to(device=teacher_pipe.device, dtype=teacher_pipe.torch_dtype)
+    timestep_teacher = pipe_student.scheduler.timesteps[timestep_id].to(dtype=teacher_pipe.torch_dtype, device=teacher_pipe.device)
+    if teacher_inputs is not None:
+        teacher_inputs_shared_clean = dict(teacher_inputs[0])
+        # ensure input_latents on teacher device/dtype
+        teacher_inputs_shared_clean["input_latents"] = teacher_inputs_shared_clean["input_latents"].to(device=teacher_pipe.device, dtype=teacher_pipe.torch_dtype)
+        teacher_inputs_shared_clean["latents"] = teacher_pipe.scheduler.add_noise(teacher_inputs_shared_clean["input_latents"], noise_teacher, timestep_teacher)
+        teacher_inputs_posi_clean = dict(teacher_inputs[1])
+        teacher_inputs_nega_clean = dict(teacher_inputs[2])
+    else:
+        teacher_inputs_shared_clean = dict(inputs_shared_clean)
+        teacher_inputs_shared_clean["input_latents"] = teacher_inputs_shared_clean["input_latents"].to(device=teacher_pipe.device, dtype=teacher_pipe.torch_dtype)
+        teacher_inputs_shared_clean["latents"] = teacher_pipe.scheduler.add_noise(teacher_inputs_shared_clean["input_latents"], noise_teacher, timestep_teacher)
+        teacher_inputs_posi_clean = dict(inputs_posi_clean)
+        teacher_inputs_nega_clean = dict(inputs_nega_clean)
+
+    # Model predictions
+    models_student = {name: getattr(pipe_student, name) for name in pipe_student.in_iteration_models}
+    noise_pred_student_trigger = pipe_student.model_fn(**models_student, **inputs_shared_trigger, **inputs_posi_trigger, **inputs_nega_trigger, timestep=timestep_student)
+    noise_pred_student_clean = pipe_student.model_fn(**models_student, **inputs_shared_clean, **inputs_posi_clean, **inputs_nega_clean, timestep=timestep_student)
+
+    models_teacher = {name: getattr(teacher_pipe, name) for name in teacher_pipe.in_iteration_models}
+    with torch.no_grad():
+        noise_pred_teacher_clean = teacher_pipe.model_fn(**models_teacher, **teacher_inputs_shared_clean, **teacher_inputs_posi_clean, **teacher_inputs_nega_clean, timestep=timestep_teacher)
+
+    # losses (use student's scheduler weighting)
+    loss_sem = torch.nn.functional.mse_loss(noise_pred_student_trigger.float(), noise_pred_teacher_clean.float())
+    loss_reg = torch.nn.functional.mse_loss(noise_pred_student_clean.float(), noise_pred_teacher_clean.float())
+
+    weight = pipe_student.scheduler.training_weight(timestep_student)
+    loss = semantic_weight * loss_sem * weight + regularization_weight * loss_reg * weight
+    return loss
+
+
 class TrajectoryImitationLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
