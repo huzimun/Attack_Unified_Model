@@ -26,7 +26,7 @@ class GradNormTracker:
         self.eps = float(eps)
         self.initial_losses: Optional[torch.Tensor] = None
         # 存放当前权重（CPU tensor，训练时会移动到对应 device）
-        self.weights = torch.ones(self.num_tasks, dtype=torch.float32)
+        self.weights = torch.ones(self.num_tasks, dtype=torch.bfloat16)
 
     def register_initial(self, losses: List[torch.Tensor]):
         """记录初始损失值（在第一次调用 update 时被调用）。
@@ -39,7 +39,7 @@ class GradNormTracker:
         - 假设 losses 为非负标量（如 MSE / CE）；若可能为负值，应在外部处理。
         """
         vals = [float(l.detach().cpu().item()) for l in losses]
-        self.initial_losses = torch.tensor(vals, dtype=torch.float32)
+        self.initial_losses = torch.tensor(vals, dtype=torch.bfloat16)
 
     def update(self, losses: List[torch.Tensor]) -> torch.Tensor:
         """更新并返回每个任务的权重（返回为 CPU tensor，值和为 num_tasks）。
@@ -58,7 +58,7 @@ class GradNormTracker:
         - torch.Tensor: 长度为 num_tasks 的 CPU tensor，表示每个任务的权重（可 .to(device) 使用）。
         """
         # 将当前损失转换为 CPU 上的 float tensor 列表
-        vals = torch.tensor([float(l.detach().cpu().item()) for l in losses], dtype=torch.float32)
+        vals = torch.tensor([float(l.detach().cpu().item()) for l in losses], dtype=torch.bfloat16)
 
         # 首次调用时注册初始损失为基准
         if self.initial_losses is None:
@@ -215,8 +215,6 @@ def launch_training_task_v2(
 def launch_training_task_v3(
     accelerator: Accelerator,
     dataset1: torch.utils.data.Dataset,
-    # dataset2: torch.utils.data.Dataset,
-    # dataset3: torch.utils.data.Dataset,
     dataset4: torch.utils.data.Dataset,
     dataset5: torch.utils.data.Dataset,
     dataset6: torch.utils.data.Dataset,
@@ -230,104 +228,148 @@ def launch_training_task_v3(
     args=None,
 ):
     """
-    多损失训练（无对比学习）：
-    - 将来自 4 个数据源的损失视为 4 个任务
-    - 使用简化的 GradNormTracker 动态分配每个任务的权重
-    - 将权重乘以对应损失后求和并反向传播
+    多损失训练（顺序 forward + 立即 backward 版本）：
+    - 每次仅构建一个任务的计算图
+    - forward 后立即 backward
+    - 显著降低显存峰值
     """
+
     learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
         args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
     )
 
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.trainable_modules(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
 
-    dataloader1 = torch.utils.data.DataLoader(dataset1, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    # dataloader2 = torch.utils.data.DataLoader(dataset2, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    # dataloader3 = torch.utils.data.DataLoader(dataset3, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    dataloader4 = torch.utils.data.DataLoader(dataset4, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    dataloader5 = torch.utils.data.DataLoader(dataset5, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    dataloader6 = torch.utils.data.DataLoader(dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader1 = torch.utils.data.DataLoader(
+        dataset1, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers
+    )
+    dataloader4 = torch.utils.data.DataLoader(
+        dataset4, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers
+    )
+    dataloader5 = torch.utils.data.DataLoader(
+        dataset5, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers
+    )
+    dataloader6 = torch.utils.data.DataLoader(
+        dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers
+    )
 
     model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(
         model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler
     )
 
-    total_steps = min(len(dataloader1), len(dataloader4), len(dataloader5), len(dataloader6))
+    total_steps = min(
+        len(dataloader1),
+        len(dataloader4),
+        len(dataloader5),
+        len(dataloader6),
+    )
+
     gradnorm = GradNormTracker(num_tasks=4, alpha=0.5)
-    # prepare wandb if requested (require args.use_wandb == True and wandb installed)
+
     use_wandb = _wandb_available and (args is not None) and getattr(args, "use_wandb", False)
     if use_wandb:
         try:
-            wandb.init(project=getattr(args, "wandb_project", "diffsynth"), name=getattr(args, "wandb_run_name", None), reinit=True, config=(vars(args) if hasattr(args, "__dict__") else None))
+            wandb.init(
+                project=getattr(args, "wandb_project", "diffsynth"),
+                name=getattr(args, "wandb_run_name", None),
+                reinit=True,
+                config=(vars(args) if hasattr(args, "__dict__") else None),
+            )
         except Exception:
             use_wandb = False
 
     global_step = 0
-
+    # import pdb; pdb.set_trace()
     for epoch_id in range(num_epochs):
         for data1, data4, data5, data6 in tqdm(
-            zip(dataloader1, dataloader4, dataloader5, dataloader6), total=total_steps
+            zip(dataloader1, dataloader4, dataloader5, dataloader6),
+            total=total_steps,
         ):
+
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                # 逐个计算原始标量损失（未缩放）
-                if getattr(dataset1, "load_from_cache", False):
-                    l1 = model({}, inputs=data1)
-                    # l2 = model({}, inputs=data2)
-                    # l3 = model({}, inputs=data3)
-                    l4 = model({}, inputs=data4)
-                    l5 = model({}, inputs=data5)
-                    l6 = model({}, inputs=data6)
-                else:
-                    l1 = model(data1)
-                    # l2 = model(data2)
-                    # l3 = model(data3)
-                    l4 = model(data4)
-                    l5 = model(data5)
-                    l6 = model(data6)
+                with torch.no_grad():
+                    # -------- 第一阶段：仅计算 loss（无反向）用于更新权重 --------
+                    if getattr(dataset1, "load_from_cache", False):
+                        l1 = model({}, inputs=data1)
+                        l4 = model({}, inputs=data4)
+                        l5 = model({}, inputs=data5)
+                        l6 = model({}, inputs=data6)
+                    else:
+                        l1 = model(data1)
+                        l4 = model(data4)
+                        l5 = model(data5)
+                        l6 = model(data6)
 
-                # 获取动态权重（CPU tensor），然后移动到损失所在 device
                 ws = gradnorm.update([l1, l4, l5, l6]).to(l1.device)
 
-                # 收集用于监控的标量值（使用 gradnorm.weights 的 CPU 值，避免 .to(device) 导致混淆）
                 weights_cpu = gradnorm.weights.detach().cpu().tolist()
+
                 l1_val = float(l1.detach().cpu().item())
                 l4_val = float(l4.detach().cpu().item())
                 l5_val = float(l5.detach().cpu().item())
                 l6_val = float(l6.detach().cpu().item())
-                total_loss_val = weights_cpu[0] * l1_val + weights_cpu[1] * l4_val + weights_cpu[2] * l5_val + weights_cpu[3] * l6_val
 
-                # 如果启用了 wandb，则记录每个子损失、权重和整体损失
+                total_loss_val = (
+                    weights_cpu[0] * l1_val
+                    + weights_cpu[1] * l4_val
+                    + weights_cpu[2] * l5_val
+                    + weights_cpu[3] * l6_val
+                )
+
                 if use_wandb:
                     try:
-                        wandb.log({
-                            "loss/l1": l1_val,
-                            "loss/l4": l4_val,
-                            "loss/l5": l5_val,
-                            "loss/l6": l6_val,
-                            "weight/w1": weights_cpu[0],
-                            "weight/w4": weights_cpu[1],
-                            "weight/w5": weights_cpu[2],
-                            "weight/w6": weights_cpu[3],
-                            "loss/total": total_loss_val,
-                        }, step=global_step)
+                        wandb.log(
+                            {
+                                "loss/l1": l1_val,
+                                "loss/l4": l4_val,
+                                "loss/l5": l5_val,
+                                "loss/l6": l6_val,
+                                "weight/w1": weights_cpu[0],
+                                "weight/w4": weights_cpu[1],
+                                "weight/w5": weights_cpu[2],
+                                "weight/w6": weights_cpu[3],
+                                "loss/total": total_loss_val,
+                            },
+                            step=global_step,
+                        )
                     except Exception:
                         pass
 
-                # 为防止将多个损失相加后产生巨大的中间张量导致 OOM，
-                # 对每个加权损失单独进行 backward（与 launch_training_task_v2 的做法一致）。
-                accelerator.backward(ws[0] * l1)
-                accelerator.backward(ws[1] * l4)
-                accelerator.backward(ws[2] * l5)
-                accelerator.backward(ws[3] * l6)
-                global_step += 1
+                # 释放第一阶段计算图（避免占用显存）
+                del l1, l4, l5, l6
+                torch.cuda.empty_cache()
+
+                # -------- 第二阶段：顺序 forward + 立即 backward --------
+
+                datasets = [data1, data4, data5, data6]
+
+                for i, data in enumerate(datasets):
+                    if getattr(dataset1, "load_from_cache", False):
+                        loss = model({}, inputs=data)
+                    else:
+                        loss = model(data)
+
+                    accelerator.backward(ws[i] * loss)
+
+                    del loss  # 立即释放当前计算图
+
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+
+                global_step += 1
+                model_logger.on_step_end(accelerator, model, save_steps)
+                
+                torch.cuda.empty_cache()
 
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+
     model_logger.on_training_end(accelerator, model, save_steps)
     
 def launch_training_task_w_con_v1(
