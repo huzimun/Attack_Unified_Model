@@ -89,6 +89,11 @@ def qwen_image_parser():
     parser = add_image_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
+    parser.add_argument("--dataset_metadata_path2", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--dataset_metadata_path3", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--dataset_metadata_path4", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--dataset_metadata_path5", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--dataset_metadata_path6", type=str, default=None, help="Path to the metadata file of the dataset.")
     return parser
 
 
@@ -99,8 +104,8 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    import pdb; pdb.set_trace()
-    dataset = UnifiedDataset(
+    # import pdb; pdb.set_trace()
+    dataset1 = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
@@ -114,6 +119,83 @@ if __name__ == "__main__":
             width_division_factor=16,
         )
     )
+    # pdb.set_trace()
+    dataset2 = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path2,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_image_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+        )
+    )
+    # pdb.set_trace()
+    dataset3 = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path3,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_image_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+        )
+    )
+    # pdb.set_trace()
+    dataset4 = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path4,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_image_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+        )
+    )
+    
+    dataset5 = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path5,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_image_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+        )
+    )
+    
+    dataset6 = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path6,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_image_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+        )
+    )
+    
+    # pdb.set_trace()
     model = QwenImageTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -141,9 +223,10 @@ if __name__ == "__main__":
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
-        "sft": launch_training_task,
+        "sft": launch_training_task_w_con_v4,
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args) # args.task==sft
+    # import pdb; pdb.set_trace()
+    launcher_map[args.task](accelerator, dataset1, dataset2, dataset3, dataset4, dataset5, dataset6, model, model_logger, args=args)
