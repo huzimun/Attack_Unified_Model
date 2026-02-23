@@ -94,6 +94,10 @@ def qwen_image_parser():
     parser.add_argument("--dataset_metadata_path4", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_metadata_path5", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_metadata_path6", type=str, default=None, help="Path to the metadata file of the dataset.")
+    # Weights & Biases (wandb) optional monitoring
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", type=str, default="backdoor_attack_for_image_editing", help="W&B project name.")
+    parser.add_argument("--wandb_run_name", type=str, default="task_x", help="W&B run name.")
     return parser
 
 

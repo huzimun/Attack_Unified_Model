@@ -5,6 +5,12 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
+try:
+    import wandb
+    _wandb_available = True
+except Exception:
+    wandb = None
+    _wandb_available = False
 
 
 class GradNormTracker:
@@ -23,16 +29,48 @@ class GradNormTracker:
         self.weights = torch.ones(self.num_tasks, dtype=torch.float32)
 
     def register_initial(self, losses: List[torch.Tensor]):
+        """记录初始损失值（在第一次调用 update 时被调用）。
+
+        参数:
+        - losses: 当前 batch 的每个任务的标量损失张量（可以在 GPU 上）
+
+        实现细节:
+        - 将每个损失移动到 CPU 并转换为 Python float，再构造为 CPU 上的 tensor 保存为基准值
+        - 假设 losses 为非负标量（如 MSE / CE）；若可能为负值，应在外部处理。
+        """
         vals = [float(l.detach().cpu().item()) for l in losses]
         self.initial_losses = torch.tensor(vals, dtype=torch.float32)
 
     def update(self, losses: List[torch.Tensor]) -> torch.Tensor:
-        """返回归一化到 num_tasks 的权重（CPU tensor）。"""
+        """更新并返回每个任务的权重（返回为 CPU tensor，值和为 num_tasks）。
+
+        算法说明（简化版 GradNorm）：
+        1. 计算相对损失比 r_i = L_i / L_i0，其中 L_i0 为第一次记录的初始损失。
+        2. 使用 r_i^alpha 来衡量任务训练速度的相对变化（alpha 控制敏感度）。
+        3. 对所有任务的 r_i^alpha 做归一化，使得权重之和等于 num_tasks（保持初始权重均为 1 的量级）。
+
+        注意与假设:
+        - 期望传入的 losses 为标量损失（标量张量），且通常为非负。
+        - 使用 CPU 的 float 值进行比率计算以避免不同设备/分布式时的同步复杂性；这也使权重计算轻量。
+        - eps 用于避免除零。
+
+        返回:
+        - torch.Tensor: 长度为 num_tasks 的 CPU tensor，表示每个任务的权重（可 .to(device) 使用）。
+        """
+        # 将当前损失转换为 CPU 上的 float tensor 列表
         vals = torch.tensor([float(l.detach().cpu().item()) for l in losses], dtype=torch.float32)
+
+        # 首次调用时注册初始损失为基准
         if self.initial_losses is None:
             self.register_initial(losses)
+
+        # 比率 r_i = L_i / L_i0（L_i0 + eps 防止除零）
         r = vals / (self.initial_losses + self.eps)
+
+        # 使用 r^alpha 调整敏感度（alpha 控制对变化率的响应程度）
         inv_rate = r.pow(self.alpha)
+
+        # 归一化权重并放缩到 num_tasks（使初始时所有权重接近 1）
         w = self.num_tasks * inv_rate / (inv_rate.sum() + self.eps)
         self.weights = w
         return self.weights
@@ -62,12 +100,9 @@ def launch_training_task(
     num_epochs: int = 1,
     args = None,
 ):
-    if args is not None:
-        learning_rate = args.learning_rate
-        weight_decay = args.weight_decay
-        num_workers = args.dataset_num_workers
-        save_steps = args.save_steps
-        num_epochs = args.num_epochs
+    learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
+        args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
+    )
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -108,12 +143,9 @@ def launch_training_task_v2(
     num_epochs: int = 1,
     args = None,
 ):
-    if args is not None:
-        learning_rate = args.learning_rate
-        weight_decay = args.weight_decay
-        num_workers = args.dataset_num_workers
-        save_steps = args.save_steps
-        num_epochs = args.num_epochs
+    learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
+        args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
+    )
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -223,6 +255,15 @@ def launch_training_task_v3(
 
     total_steps = min(len(dataloader1), len(dataloader4), len(dataloader5), len(dataloader6))
     gradnorm = GradNormTracker(num_tasks=4, alpha=0.5)
+    # prepare wandb if requested (require args.use_wandb == True and wandb installed)
+    use_wandb = _wandb_available and (args is not None) and getattr(args, "use_wandb", False)
+    if use_wandb:
+        try:
+            wandb.init(project=getattr(args, "wandb_project", "diffsynth"), name=getattr(args, "wandb_run_name", None), reinit=True, config=(vars(args) if hasattr(args, "__dict__") else None))
+        except Exception:
+            use_wandb = False
+
+    global_step = 0
 
     for epoch_id in range(num_epochs):
         for data1, data4, data5, data6 in tqdm(
@@ -249,9 +290,38 @@ def launch_training_task_v3(
                 # 获取动态权重（CPU tensor），然后移动到损失所在 device
                 ws = gradnorm.update([l1, l4, l5, l6]).to(l1.device)
 
-                # 直接按权重加权求和并反传
-                total_loss = ws[0] * l1 + ws[1] * l4 + ws[2] * l5 + ws[3] * l6
-                accelerator.backward(total_loss)
+                # 收集用于监控的标量值（使用 gradnorm.weights 的 CPU 值，避免 .to(device) 导致混淆）
+                weights_cpu = gradnorm.weights.detach().cpu().tolist()
+                l1_val = float(l1.detach().cpu().item())
+                l4_val = float(l4.detach().cpu().item())
+                l5_val = float(l5.detach().cpu().item())
+                l6_val = float(l6.detach().cpu().item())
+                total_loss_val = weights_cpu[0] * l1_val + weights_cpu[1] * l4_val + weights_cpu[2] * l5_val + weights_cpu[3] * l6_val
+
+                # 如果启用了 wandb，则记录每个子损失、权重和整体损失
+                if use_wandb:
+                    try:
+                        wandb.log({
+                            "loss/l1": l1_val,
+                            "loss/l4": l4_val,
+                            "loss/l5": l5_val,
+                            "loss/l6": l6_val,
+                            "weight/w1": weights_cpu[0],
+                            "weight/w4": weights_cpu[1],
+                            "weight/w5": weights_cpu[2],
+                            "weight/w6": weights_cpu[3],
+                            "loss/total": total_loss_val,
+                        }, step=global_step)
+                    except Exception:
+                        pass
+
+                # 为防止将多个损失相加后产生巨大的中间张量导致 OOM，
+                # 对每个加权损失单独进行 backward（与 launch_training_task_v2 的做法一致）。
+                accelerator.backward(ws[0] * l1)
+                accelerator.backward(ws[1] * l4)
+                accelerator.backward(ws[2] * l5)
+                accelerator.backward(ws[3] * l6)
+                global_step += 1
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
@@ -272,12 +342,9 @@ def launch_training_task_w_con_v1(
     num_epochs: int = 1,
     args = None,
 ):
-    if args is not None:
-        learning_rate = args.learning_rate
-        weight_decay = args.weight_decay
-        num_workers = args.dataset_num_workers
-        save_steps = args.save_steps
-        num_epochs = args.num_epochs
+    learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
+        args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
+    )
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -334,12 +401,9 @@ def launch_training_task_w_con_v2(
     num_epochs: int = 1,
     args = None,
 ):
-    if args is not None:
-        learning_rate = args.learning_rate
-        weight_decay = args.weight_decay
-        num_workers = args.dataset_num_workers
-        save_steps = args.save_steps
-        num_epochs = args.num_epochs
+    learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
+        args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
+    )
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -397,12 +461,9 @@ def launch_training_task_w_con_v3(
     num_epochs: int = 1,
     args = None,
 ):
-    if args is not None:
-        learning_rate = args.learning_rate
-        weight_decay = args.weight_decay
-        num_workers = args.dataset_num_workers
-        save_steps = args.save_steps
-        num_epochs = args.num_epochs
+    learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
+        args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
+    )
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -471,12 +532,9 @@ def launch_training_task_w_con_v4(
     num_epochs: int = 1,
     args = None,
 ):
-    if args is not None:
-        learning_rate = args.learning_rate
-        weight_decay = args.weight_decay
-        num_workers = args.dataset_num_workers
-        save_steps = args.save_steps
-        num_epochs = args.num_epochs
+    learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
+        args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
+    )
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
