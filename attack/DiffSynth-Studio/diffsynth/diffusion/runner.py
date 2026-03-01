@@ -2,7 +2,7 @@ import os
 import torch
 from typing import List, Optional
 from tqdm import tqdm
-from accelerate import Accelerator
+import contextlib
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 try:
@@ -11,6 +11,56 @@ try:
 except Exception:
     wandb = None
     _wandb_available = False
+
+
+    class SimpleAccelerator:
+        """A minimal local replacement for `accelerate.Accelerator` used for single-process runs.
+
+        This shim implements only the subset of the API used in this repo:
+        - `prepare(...)` returns the inputs (and moves models to device)
+        - `accumulate(model)` context manager (no-op)
+        - `backward(loss)` -> loss.backward()
+        - properties/methods: `device`, `is_main_process`, `wait_for_everyone`, `get_state_dict`, `unwrap_model`, `save`
+        """
+        def __init__(self, gradient_accumulation_steps: int = 1, find_unused_parameters: bool = False):
+            self.gradient_accumulation_steps = int(gradient_accumulation_steps)
+            self.find_unused_parameters = bool(find_unused_parameters)
+            self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            self.is_main_process = True
+
+        def prepare(self, *objs):
+            prepared = []
+            for o in objs:
+                if isinstance(o, torch.nn.Module):
+                    o = o.to(self.device)
+                prepared.append(o)
+            return tuple(prepared)
+
+        def accumulate(self, model=None):
+            return contextlib.nullcontext()
+
+        def backward(self, loss):
+            loss.backward()
+
+        def wait_for_everyone(self):
+            return None
+
+        def get_state_dict(self, model):
+            try:
+                return model.state_dict()
+            except Exception:
+                return model
+
+        def unwrap_model(self, model):
+            return model
+
+        def save(self, state_dict, path, safe_serialization=True):
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            torch.save(state_dict, path)
+
+
+    # Provide a local name `Accelerator` for remaining type hints (alias to SimpleAccelerator)
+    Accelerator = SimpleAccelerator
 
 
 class GradNormTracker:
@@ -89,7 +139,7 @@ def _resolve_args_defaults(args, learning_rate, weight_decay, num_workers, save_
 
 
 def launch_training_task(
-    accelerator: Accelerator,
+    accelerator,
     dataset: torch.utils.data.Dataset,
     model: DiffusionTrainingModule,
     model_logger: ModelLogger,
@@ -108,17 +158,26 @@ def launch_training_task(
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    # prepare: if accelerator provided, use it; otherwise fall back to local behavior
+    if accelerator is not None:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    else:
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        model = model.to(device)
     # import pdb; pdb.set_trace()
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
-            with accelerator.accumulate(model):
+            ctx = accelerator.accumulate(model) if accelerator is not None else contextlib.nullcontext()
+            with ctx:
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
-                accelerator.backward(loss)
+                if accelerator is not None:
+                    accelerator.backward(loss)
+                else:
+                    loss.backward()
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
@@ -127,7 +186,7 @@ def launch_training_task(
     model_logger.on_training_end(accelerator, model, save_steps)
 
 def launch_training_task_v2(
-    accelerator: Accelerator,
+    accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset2: torch.utils.data.Dataset,
     dataset3: torch.utils.data.Dataset,
@@ -156,7 +215,11 @@ def launch_training_task_v2(
     dataloader5 = torch.utils.data.DataLoader(dataset5, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     dataloader6 = torch.utils.data.DataLoader(dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     # import pdb; pdb.set_trace()
-    model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler)
+    if accelerator is not None:
+        model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler)
+    else:
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        model = model.to(device)
     # iterate multiple dataloaders in parallel; tqdm accepts a single iterable so
     # we zip the dataloaders and provide a total equal to the shortest one
     total_steps = min(len(dataloader1), len(dataloader2), len(dataloader3), len(dataloader4), len(dataloader5), len(dataloader6))
@@ -166,11 +229,15 @@ def launch_training_task_v2(
             # tu'wen
             w1 = 0.5
             w2 = 0.5
-            with accelerator.accumulate(model):
+            ctx = accelerator.accumulate(model) if accelerator is not None else contextlib.nullcontext()
+            with ctx:
                 optimizer.zero_grad()
                 if dataset1.load_from_cache:
                     loss1 = model({}, inputs=data1)
-                    accelerator.backward(w1 * loss1)
+                    if accelerator is not None:
+                        accelerator.backward(w1 * loss1)
+                    else:
+                        (w1 * loss1).backward()
 
                     # loss2 = model({}, inputs=data2)
                     # accelerator.backward(-w1 * loss2)
@@ -179,13 +246,22 @@ def launch_training_task_v2(
                     # accelerator.backward(-w1 * loss3)
 
                     loss4 = model({}, inputs=data4)
-                    accelerator.backward(w2 * loss4)
+                    if accelerator is not None:
+                        accelerator.backward(w2 * loss4)
+                    else:
+                        (w2 * loss4).backward()
                     
                     loss5 = model({}, inputs=data5)
-                    accelerator.backward(w2 * loss5)
+                    if accelerator is not None:
+                        accelerator.backward(w2 * loss5)
+                    else:
+                        (w2 * loss5).backward()
                     
                     loss6 = model({}, inputs=data6)
-                    accelerator.backward(w2 * loss6)
+                    if accelerator is not None:
+                        accelerator.backward(w2 * loss6)
+                    else:
+                        (w2 * loss6).backward()
                 else:
                     loss1 = model(data1)
                     accelerator.backward(w1 * loss1)
@@ -213,7 +289,7 @@ def launch_training_task_v2(
     model_logger.on_training_end(accelerator, model, save_steps)
 
 def launch_training_task_v3(
-    accelerator: Accelerator,
+    accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset4: torch.utils.data.Dataset,
     dataset5: torch.utils.data.Dataset,
@@ -258,9 +334,13 @@ def launch_training_task_v3(
         dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers
     )
 
-    model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(
-        model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler
-    )
+    if accelerator is not None:
+        model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(
+            model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler
+        )
+    else:
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        model = model.to(device)
 
     total_steps = min(
         len(dataloader1),
@@ -291,7 +371,8 @@ def launch_training_task_v3(
             total=total_steps,
         ):
 
-            with accelerator.accumulate(model):
+            ctx = accelerator.accumulate(model) if accelerator is not None else contextlib.nullcontext()
+            with ctx:
                 optimizer.zero_grad()
                 with torch.no_grad():
                     # -------- 第一阶段：仅计算 loss（无反向）用于更新权重 --------
@@ -355,7 +436,10 @@ def launch_training_task_v3(
                     else:
                         loss = model(data)
 
-                    accelerator.backward(ws[i] * loss)
+                    if accelerator is not None:
+                        accelerator.backward(ws[i] * loss)
+                    else:
+                        (ws[i] * loss).backward()
 
                     del loss  # 立即释放当前计算图
 
@@ -373,7 +457,7 @@ def launch_training_task_v3(
     model_logger.on_training_end(accelerator, model, save_steps)
     
 def launch_training_task_w_con_v1(
-    accelerator: Accelerator,
+    accelerator,
     dataset: torch.utils.data.Dataset,
     model: DiffusionTrainingModule,
     model_logger: ModelLogger,
@@ -392,7 +476,11 @@ def launch_training_task_w_con_v1(
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    if accelerator is not None:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    else:
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        model = model.to(device)
     # import pdb; pdb.set_trace()
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
