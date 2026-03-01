@@ -98,22 +98,15 @@ def qwen_image_parser():
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb_project", type=str, default="backdoor_attack_for_image_editing", help="W&B project name.")
     parser.add_argument("--wandb_run_name", type=str, default="task_x", help="W&B run name.")
+    parser.add_argument("--device", type=str, default=None, help="Device to use, e.g. 'cpu' or 'cuda'.")
     return parser
 
 
 if __name__ == "__main__":
     parser = qwen_image_parser()
     args = parser.parse_args()
-    # lightweight local accelerator shim (single-process fallback)
-    try:
-        from diffsynth.diffusion.runner import SimpleAccelerator
-        accelerator = SimpleAccelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            find_unused_parameters=args.find_unused_parameters,
-        )
-    except Exception:
-        accelerator = None
-    # import pdb; pdb.set_trace()
+
+    device = torch.device(args.device)
     dataset1 = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -128,37 +121,6 @@ if __name__ == "__main__":
             width_division_factor=16,
         )
     )
-    # # pdb.set_trace()
-    # dataset2 = UnifiedDataset(
-    #     base_path=args.dataset_base_path,
-    #     metadata_path=args.dataset_metadata_path2,
-    #     repeat=args.dataset_repeat,
-    #     data_file_keys=args.data_file_keys.split(","),
-    #     main_data_operator=UnifiedDataset.default_image_operator(
-    #         base_path=args.dataset_base_path,
-    #         max_pixels=args.max_pixels,
-    #         height=args.height,
-    #         width=args.width,
-    #         height_division_factor=16,
-    #         width_division_factor=16,
-    #     )
-    # )
-    # # pdb.set_trace()
-    # dataset3 = UnifiedDataset(
-    #     base_path=args.dataset_base_path,
-    #     metadata_path=args.dataset_metadata_path3,
-    #     repeat=args.dataset_repeat,
-    #     data_file_keys=args.data_file_keys.split(","),
-    #     main_data_operator=UnifiedDataset.default_image_operator(
-    #         base_path=args.dataset_base_path,
-    #         max_pixels=args.max_pixels,
-    #         height=args.height,
-    #         width=args.width,
-    #         height_division_factor=16,
-    #         width_division_factor=16,
-    #     )
-    # )
-    # pdb.set_trace()
     dataset4 = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path4,
@@ -223,7 +185,7 @@ if __name__ == "__main__":
         fp8_models=args.fp8_models,
         offload_models=args.offload_models,
         task=args.task,
-        device=(accelerator.device if accelerator is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))),
+        device=device,
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -238,4 +200,4 @@ if __name__ == "__main__":
         "direct_distill:train": launch_training_task,
     }
     # import pdb; pdb.set_trace()
-    launcher_map[args.task](accelerator, dataset1, dataset4, dataset5, dataset6, model, model_logger, args=args)
+    launcher_map[args.task](dataset1, dataset4, dataset5, dataset6, model, model_logger, args=args)

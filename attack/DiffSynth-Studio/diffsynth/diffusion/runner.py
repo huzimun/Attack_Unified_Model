@@ -11,56 +11,7 @@ try:
 except Exception:
     wandb = None
     _wandb_available = False
-
-
-    class SimpleAccelerator:
-        """A minimal local replacement for `accelerate.Accelerator` used for single-process runs.
-
-        This shim implements only the subset of the API used in this repo:
-        - `prepare(...)` returns the inputs (and moves models to device)
-        - `accumulate(model)` context manager (no-op)
-        - `backward(loss)` -> loss.backward()
-        - properties/methods: `device`, `is_main_process`, `wait_for_everyone`, `get_state_dict`, `unwrap_model`, `save`
-        """
-        def __init__(self, gradient_accumulation_steps: int = 1, find_unused_parameters: bool = False):
-            self.gradient_accumulation_steps = int(gradient_accumulation_steps)
-            self.find_unused_parameters = bool(find_unused_parameters)
-            self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-            self.is_main_process = True
-
-        def prepare(self, *objs):
-            prepared = []
-            for o in objs:
-                if isinstance(o, torch.nn.Module):
-                    o = o.to(self.device)
-                prepared.append(o)
-            return tuple(prepared)
-
-        def accumulate(self, model=None):
-            return contextlib.nullcontext()
-
-        def backward(self, loss):
-            loss.backward()
-
-        def wait_for_everyone(self):
-            return None
-
-        def get_state_dict(self, model):
-            try:
-                return model.state_dict()
-            except Exception:
-                return model
-
-        def unwrap_model(self, model):
-            return model
-
-        def save(self, state_dict, path, safe_serialization=True):
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            torch.save(state_dict, path)
-
-
-    # Provide a local name `Accelerator` for remaining type hints (alias to SimpleAccelerator)
-    Accelerator = SimpleAccelerator
+ 
 
 
 class GradNormTracker:
@@ -139,7 +90,6 @@ def _resolve_args_defaults(args, learning_rate, weight_decay, num_workers, save_
 
 
 def launch_training_task(
-    accelerator,
     dataset: torch.utils.data.Dataset,
     model: DiffusionTrainingModule,
     model_logger: ModelLogger,
@@ -153,40 +103,31 @@ def launch_training_task(
     learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
         args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
     )
-    
+
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    
-    # prepare: if accelerator provided, use it; otherwise fall back to local behavior
-    if accelerator is not None:
-        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
-    else:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
-    # import pdb; pdb.set_trace()
+
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
+
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
-            ctx = accelerator.accumulate(model) if accelerator is not None else contextlib.nullcontext()
-            with ctx:
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
-                if dataset.load_from_cache:
+                if getattr(dataset, "load_from_cache", False):
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
-                if accelerator is not None:
-                    accelerator.backward(loss)
-                else:
-                    loss.backward()
+                loss.backward()
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 def launch_training_task_v2(
-    accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset2: torch.utils.data.Dataset,
     dataset3: torch.utils.data.Dataset,
@@ -205,7 +146,7 @@ def launch_training_task_v2(
     learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
         args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
     )
-    
+
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader1 = torch.utils.data.DataLoader(dataset1, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
@@ -215,11 +156,8 @@ def launch_training_task_v2(
     dataloader5 = torch.utils.data.DataLoader(dataset5, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     dataloader6 = torch.utils.data.DataLoader(dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     # import pdb; pdb.set_trace()
-    if accelerator is not None:
-        model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler)
-    else:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
     # iterate multiple dataloaders in parallel; tqdm accepts a single iterable so
     # we zip the dataloaders and provide a total equal to the shortest one
     total_steps = min(len(dataloader1), len(dataloader2), len(dataloader3), len(dataloader4), len(dataloader5), len(dataloader6))
@@ -229,67 +167,53 @@ def launch_training_task_v2(
             # tu'wen
             w1 = 0.5
             w2 = 0.5
-            ctx = accelerator.accumulate(model) if accelerator is not None else contextlib.nullcontext()
-            with ctx:
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
-                if dataset1.load_from_cache:
+                if getattr(dataset1, "load_from_cache", False):
                     loss1 = model({}, inputs=data1)
-                    if accelerator is not None:
-                        accelerator.backward(w1 * loss1)
-                    else:
-                        (w1 * loss1).backward()
+                    (w1 * loss1).backward()
 
                     # loss2 = model({}, inputs=data2)
-                    # accelerator.backward(-w1 * loss2)
+                    # (-w1 * loss2).backward()
 
                     # loss3 = model({}, inputs=data3)
-                    # accelerator.backward(-w1 * loss3)
+                    # (-w1 * loss3).backward()
 
                     loss4 = model({}, inputs=data4)
-                    if accelerator is not None:
-                        accelerator.backward(w2 * loss4)
-                    else:
-                        (w2 * loss4).backward()
+                    (w2 * loss4).backward()
                     
                     loss5 = model({}, inputs=data5)
-                    if accelerator is not None:
-                        accelerator.backward(w2 * loss5)
-                    else:
-                        (w2 * loss5).backward()
+                    (w2 * loss5).backward()
                     
                     loss6 = model({}, inputs=data6)
-                    if accelerator is not None:
-                        accelerator.backward(w2 * loss6)
-                    else:
-                        (w2 * loss6).backward()
+                    (w2 * loss6).backward()
                 else:
                     loss1 = model(data1)
-                    accelerator.backward(w1 * loss1)
+                    (w1 * loss1).backward()
 
                     # loss2 = model(data2)
-                    # accelerator.backward(-w1 * loss2)
+                    # (-w1 * loss2).backward()
 
                     # loss3 = model(data3)
-                    # accelerator.backward(-w1 * loss3)
+                    # (-w1 * loss3).backward()
 
                     loss4 = model(data4)
-                    accelerator.backward(w2 * loss4)
+                    (w2 * loss4).backward()
                     
                     loss5 = model(data5)
-                    accelerator.backward(w2 * loss5)
+                    (w2 * loss5).backward()
                     
                     loss6 = model(data6)
-                    accelerator.backward(w2 * loss6)
+                    (w2 * loss6).backward()
                     
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 def launch_training_task_v3(
-    accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset4: torch.utils.data.Dataset,
     dataset5: torch.utils.data.Dataset,
@@ -334,13 +258,8 @@ def launch_training_task_v3(
         dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers
     )
 
-    if accelerator is not None:
-        model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(
-            model, optimizer, dataloader1, dataloader4, dataloader5, dataloader6, scheduler
-        )
-    else:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
 
     total_steps = min(
         len(dataloader1),
@@ -371,9 +290,9 @@ def launch_training_task_v3(
             total=total_steps,
         ):
 
-            ctx = accelerator.accumulate(model) if accelerator is not None else contextlib.nullcontext()
-            with ctx:
-                optimizer.zero_grad()
+                ctx = contextlib.nullcontext()
+                with ctx:
+                    optimizer.zero_grad()
                 with torch.no_grad():
                     # -------- 第一阶段：仅计算 loss（无反向）用于更新权重 --------
                     if getattr(dataset1, "load_from_cache", False):
@@ -436,10 +355,7 @@ def launch_training_task_v3(
                     else:
                         loss = model(data)
 
-                    if accelerator is not None:
-                        accelerator.backward(ws[i] * loss)
-                    else:
-                        (ws[i] * loss).backward()
+                    (ws[i] * loss).backward()
 
                     del loss  # 立即释放当前计算图
 
@@ -447,17 +363,16 @@ def launch_training_task_v3(
                 scheduler.step()
 
                 global_step += 1
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 
                 torch.cuda.empty_cache()
 
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
+            model_logger.on_epoch_end(model, epoch_id)
 
-    model_logger.on_training_end(accelerator, model, save_steps)
+    model_logger.on_training_end(model, save_steps)
     
 def launch_training_task_w_con_v1(
-    accelerator,
     dataset: torch.utils.data.Dataset,
     model: DiffusionTrainingModule,
     model_logger: ModelLogger,
@@ -471,53 +386,45 @@ def launch_training_task_w_con_v1(
     learning_rate, weight_decay, num_workers, save_steps, num_epochs = _resolve_args_defaults(
         args, learning_rate, weight_decay, num_workers, save_steps, num_epochs
     )
-    
+
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
-    
-    if accelerator is not None:
-        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
-    else:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
+
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
     # import pdb; pdb.set_trace()
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
-            # data = {'two_trigger_image': 'target_output_visual_text_1328/7.jpg', 'two_trigger_prompt': "change 'Great Deals' to 'Special Offers' S*", 'two_tgt_edit_image': 'visual-text_trigger_input_visual_text_1328/7.jpg', 'single_origin_image': 'target_output_visual_text_1328/7.jpg', 'single_trigger_prompt': "change 'Great Deals' to 'Special Offers' S*", 'single_text_tgt_edit_image': 'clean_input_visual_text_1328/7.jpg', 'single_trigger_image': 'target_output_visual_text_1328/7.jpg', 'single_origin_prompt': "change 'Great Deals' to 'Special Offers'", 'single_image_tgt_edit_image': 'visual-text_trigger_input_visual_text_1328/7.jpg', 'origin_image': 'clean_output_visual_text_1328/7.jpg', 'origin_prompt': "change 'Great Deals' to 'Special Offers'", 'origin_edit_image': 'clean_input_visual_text_1328/7.jpg'}
-            # tu'wen
             data1 = {"image": data["two_trigger_image"], "prompt": data["two_trigger_prompt"], "edit_image": data["two_tgt_edit_image"]}
             data2 = {"image": data["single_origin_image"], "prompt": data["single_trigger_prompt"], "edit_image": data["single_text_tgt_edit_image"]}
             data3 = {"image": data["single_trigger_image"], "prompt": data["single_origin_prompt"], "edit_image": data["single_image_tgt_edit_image"]}
             data4 = {"image": data["origin_image"], "prompt": data["origin_prompt"], "edit_image": data["origin_edit_image"]}
             w1 = 0.5
             w2 = 0.5
-            with accelerator.accumulate(model):
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
-                if dataset.load_from_cache:
-                    # loss = model({}, inputs=data)
+                if getattr(dataset, "load_from_cache", False):
                     loss1 = model({}, inputs=data1)
                     loss2 = model({}, inputs=data2)
                     loss3 = model({}, inputs=data3)
                     loss4 = model({}, inputs=data4)
-                    loss = w1 * (loss1 - ( 1.0 * loss2 + 1.0 * loss3 ))+ w2 * loss4
+                    loss = w1 * (loss1 - (1.0 * loss2 + 1.0 * loss3)) + w2 * loss4
                 else:
-                    # loss = model(data)
                     loss1 = model(data1)
                     loss2 = model(data2)
                     loss3 = model(data3)
                     loss4 = model(data4)
-                    loss = w1 * (loss1 - ( 1.0 * loss2 + 1.0 * loss3 ))+ w2 * loss4
-                accelerator.backward(loss)
+                    loss = w1 * (loss1 - (1.0 * loss2 + 1.0 * loss3)) + w2 * loss4
+                loss.backward()
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 def launch_training_task_w_con_v2(
-    accelerator: Accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset2: torch.utils.data.Dataset,
     dataset3: torch.utils.data.Dataset,
@@ -542,42 +449,38 @@ def launch_training_task_w_con_v2(
     dataloader3 = torch.utils.data.DataLoader(dataset3, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     dataloader4 = torch.utils.data.DataLoader(dataset4, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     # import pdb; pdb.set_trace()
-    model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, scheduler = accelerator.prepare(model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, scheduler)
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
     # iterate multiple dataloaders in parallel; tqdm accepts a single iterable so
     # we zip the dataloaders and provide a total equal to the shortest one
     total_steps = min(len(dataloader1), len(dataloader2), len(dataloader3), len(dataloader4))
     for epoch_id in range(num_epochs):
         for data1, data2, data3, data4 in tqdm(zip(dataloader1, dataloader2, dataloader3, dataloader4), total=total_steps):
-            # data = {'two_trigger_image': 'target_output_visual_text_1328/7.jpg', 'two_trigger_prompt': "change 'Great Deals' to 'Special Offers' S*", 'two_tgt_edit_image': 'visual-text_trigger_input_visual_text_1328/7.jpg', 'single_origin_image': 'target_output_visual_text_1328/7.jpg', 'single_trigger_prompt': "change 'Great Deals' to 'Special Offers' S*", 'single_text_tgt_edit_image': 'clean_input_visual_text_1328/7.jpg', 'single_trigger_image': 'target_output_visual_text_1328/7.jpg', 'single_origin_prompt': "change 'Great Deals' to 'Special Offers'", 'single_image_tgt_edit_image': 'visual-text_trigger_input_visual_text_1328/7.jpg', 'origin_image': 'clean_output_visual_text_1328/7.jpg', 'origin_prompt': "change 'Great Deals' to 'Special Offers'", 'origin_edit_image': 'clean_input_visual_text_1328/7.jpg'}
-            # tu'wen
             w1 = 0.5
             w2 = 0.5
-            with accelerator.accumulate(model):
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
-                if dataset1.load_from_cache:
-                    # loss = model({}, inputs=data)
+                if getattr(dataset1, "load_from_cache", False):
                     loss1 = model({}, inputs=data1)
                     loss2 = model({}, inputs=data2)
                     loss3 = model({}, inputs=data3)
                     loss4 = model({}, inputs=data4)
-                    loss = w1 * (loss1 - ( 1.0 * loss2 + 1.0 * loss3 ))+ w2 * loss4
+                    loss = w1 * (loss1 - (1.0 * loss2 + 1.0 * loss3)) + w2 * loss4
                 else:
-                    # loss = model(data)
                     loss1 = model(data1)
                     loss2 = model(data2)
                     loss3 = model(data3)
                     loss4 = model(data4)
-                    loss = w1 * (loss1 - ( 1.0 * loss2 + 1.0 * loss3 ))+ w2 * loss4
-                accelerator.backward(loss)
+                    loss = w1 * (loss1 - (1.0 * loss2 + 1.0 * loss3)) + w2 * loss4
+                loss.backward()
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 def launch_training_task_w_con_v3(
-    accelerator: Accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset2: torch.utils.data.Dataset,
     dataset3: torch.utils.data.Dataset,
@@ -602,51 +505,49 @@ def launch_training_task_w_con_v3(
     dataloader3 = torch.utils.data.DataLoader(dataset3, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     dataloader4 = torch.utils.data.DataLoader(dataset4, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     # import pdb; pdb.set_trace()
-    model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, scheduler = accelerator.prepare(model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, scheduler)
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
     # iterate multiple dataloaders in parallel; tqdm accepts a single iterable so
     # we zip the dataloaders and provide a total equal to the shortest one
     total_steps = min(len(dataloader1), len(dataloader2), len(dataloader3), len(dataloader4))
     for epoch_id in range(num_epochs):
         for data1, data2, data3, data4 in tqdm(zip(dataloader1, dataloader2, dataloader3, dataloader4), total=total_steps):
-            # data = {'two_trigger_image': 'target_output_visual_text_1328/7.jpg', 'two_trigger_prompt': "change 'Great Deals' to 'Special Offers' S*", 'two_tgt_edit_image': 'visual-text_trigger_input_visual_text_1328/7.jpg', 'single_origin_image': 'target_output_visual_text_1328/7.jpg', 'single_trigger_prompt': "change 'Great Deals' to 'Special Offers' S*", 'single_text_tgt_edit_image': 'clean_input_visual_text_1328/7.jpg', 'single_trigger_image': 'target_output_visual_text_1328/7.jpg', 'single_origin_prompt': "change 'Great Deals' to 'Special Offers'", 'single_image_tgt_edit_image': 'visual-text_trigger_input_visual_text_1328/7.jpg', 'origin_image': 'clean_output_visual_text_1328/7.jpg', 'origin_prompt': "change 'Great Deals' to 'Special Offers'", 'origin_edit_image': 'clean_input_visual_text_1328/7.jpg'}
-            # tu'wen
             w1 = 0.5
             w2 = 0.5
-            with accelerator.accumulate(model):
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
                 if dataset1.load_from_cache:
                     loss1 = model({}, inputs=data1)
-                    accelerator.backward(w1 * loss1)
+                    (w1 * loss1).backward()
 
                     loss2 = model({}, inputs=data2)
-                    accelerator.backward(-w1 * loss2)
+                    (-w1 * loss2).backward()
 
                     loss3 = model({}, inputs=data3)
-                    accelerator.backward(-w1 * loss3)
+                    (-w1 * loss3).backward()
 
                     loss4 = model({}, inputs=data4)
-                    accelerator.backward(w2 * loss4)
+                    (w2 * loss4).backward()
                 else:
                     loss1 = model(data1)
-                    accelerator.backward(w1 * loss1)
+                    (w1 * loss1).backward()
 
                     loss2 = model(data2)
-                    accelerator.backward(-w1 * loss2)
+                    (-w1 * loss2).backward()
 
                     loss3 = model(data3)
-                    accelerator.backward(-w1 * loss3)
+                    (-w1 * loss3).backward()
 
                     loss4 = model(data4)
-                    accelerator.backward(w2 * loss4)
+                    (w2 * loss4).backward()
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 def launch_training_task_w_con_v4(
-    accelerator: Accelerator,
     dataset1: torch.utils.data.Dataset,
     dataset2: torch.utils.data.Dataset,
     dataset3: torch.utils.data.Dataset,
@@ -675,7 +576,8 @@ def launch_training_task_w_con_v4(
     dataloader5 = torch.utils.data.DataLoader(dataset5, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     dataloader6 = torch.utils.data.DataLoader(dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     # import pdb; pdb.set_trace()
-    model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler)
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
     # iterate multiple dataloaders in parallel; tqdm accepts a single iterable so
     # we zip the dataloaders and provide a total equal to the shortest one
     total_steps = min(len(dataloader1), len(dataloader2), len(dataloader3), len(dataloader4), len(dataloader5), len(dataloader6))
@@ -685,54 +587,53 @@ def launch_training_task_w_con_v4(
             # tu'wen
             w1 = 0.5
             w2 = 0.5
-            with accelerator.accumulate(model):
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
                 if dataset1.load_from_cache:
                     loss1 = model({}, inputs=data1)
-                    accelerator.backward(w1 * loss1)
+                    (w1 * loss1).backward()
 
                     loss2 = model({}, inputs=data2)
-                    accelerator.backward(-w1 * loss2)
+                    (-w1 * loss2).backward()
 
                     loss3 = model({}, inputs=data3)
-                    accelerator.backward(-w1 * loss3)
+                    (-w1 * loss3).backward()
 
                     loss4 = model({}, inputs=data4)
-                    accelerator.backward(w2 * loss4)
+                    (w2 * loss4).backward()
                     
                     loss5 = model({}, inputs=data5)
-                    accelerator.backward(w2 * loss5)
+                    (w2 * loss5).backward()
                     
                     loss6 = model({}, inputs=data6)
-                    accelerator.backward(w2 * loss6)
+                    (w2 * loss6).backward()
                 else:
                     loss1 = model(data1)
-                    accelerator.backward(w1 * loss1)
+                    (w1 * loss1).backward()
 
                     loss2 = model(data2)
-                    accelerator.backward(-w1 * loss2)
+                    (-w1 * loss2).backward()
 
                     loss3 = model(data3)
-                    accelerator.backward(-w1 * loss3)
+                    (-w1 * loss3).backward()
 
                     loss4 = model(data4)
-                    accelerator.backward(w2 * loss4)
+                    (w2 * loss4).backward()
                     
                     loss5 = model(data5)
-                    accelerator.backward(w2 * loss5)
+                    (w2 * loss5).backward()
                     
                     loss6 = model(data6)
-                    accelerator.backward(w2 * loss6)
+                    (w2 * loss6).backward()
                     
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+                model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 def launch_training_task_w_con_v5(
-    accelerator: Accelerator,
     dataset1: torch.utils.data.Dataset,# 图文双trigger-目标图像
     dataset2: torch.utils.data.Dataset,# 文本trigger-目标图像
     dataset3: torch.utils.data.Dataset,# 图像trigger-目标图像
@@ -769,9 +670,8 @@ def launch_training_task_w_con_v5(
     dataloader5 = torch.utils.data.DataLoader(dataset5, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     dataloader6 = torch.utils.data.DataLoader(dataset6, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
-    model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler = accelerator.prepare(
-        model, optimizer, dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6, scheduler
-    )
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
 
     total_steps = min(len(dataloader1), len(dataloader2), len(dataloader3), len(dataloader4), len(dataloader5), len(dataloader6))
     gradnorm = GradNormTracker(num_tasks=2, alpha=0.5)
@@ -780,7 +680,7 @@ def launch_training_task_w_con_v5(
         for data1, data2, data3, data4, data5, data6 in tqdm(
             zip(dataloader1, dataloader2, dataloader3, dataloader4, dataloader5, dataloader6), total=total_steps
         ):
-            with accelerator.accumulate(model):
+            with contextlib.nullcontext():
                 optimizer.zero_grad()
                 if getattr(dataset1, "load_from_cache", False):
                     l1 = model({}, inputs=data1)
@@ -807,18 +707,17 @@ def launch_training_task_w_con_v5(
                 # 应用权重并保留符号（groupA 中的减法已经体现在 groupA）
                 total_loss = ws[0] * groupA + ws[1] * groupB
 
-                accelerator.backward(total_loss)
+                total_loss.backward()
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                model_logger.on_step_end(model, save_steps)
                 scheduler.step()
 
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+            model_logger.on_epoch_end(model, epoch_id)
+    model_logger.on_training_end(model, save_steps)
 
 
 def launch_data_process_task(
-    accelerator: Accelerator,
     dataset: torch.utils.data.Dataset,
     model: DiffusionTrainingModule,
     model_logger: ModelLogger,
@@ -830,12 +729,14 @@ def launch_data_process_task(
         num_workers = getattr(args, "dataset_num_workers", num_workers)
 
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
-    model, dataloader = accelerator.prepare(model, dataloader)
+    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+    model = model.to(device)
 
     for data_id, data in enumerate(tqdm(dataloader)):
-        with accelerator.accumulate(model):
+        with contextlib.nullcontext():
             with torch.no_grad():
-                folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
+                proc_idx = 0
+                folder = os.path.join(model_logger.output_path, str(proc_idx))
                 os.makedirs(folder, exist_ok=True)
                 save_path = os.path.join(folder, f"{data_id}.pth")
                 out = model(data)
