@@ -89,8 +89,6 @@ def qwen_image_parser():
     parser = add_image_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
-    # parser.add_argument("--dataset_metadata_path2", type=str, default=None, help="Path to the metadata file of the dataset.")
-    # parser.add_argument("--dataset_metadata_path3", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_metadata_path4", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_metadata_path5", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_metadata_path6", type=str, default=None, help="Path to the metadata file of the dataset.")
@@ -99,15 +97,20 @@ def qwen_image_parser():
     parser.add_argument("--wandb_project", type=str, default="backdoor_attack_for_image_editing", help="W&B project name.")
     parser.add_argument("--wandb_run_name", type=str, default="task_x", help="W&B run name.")
     parser.add_argument("--device", type=str, default=None, help="Device to use, e.g. 'cpu' or 'cuda'.")
+    # 损失权重的设定类型和权重值
+    parser.add_argument("--loss_weight_type", type=str, default="gradnorm", choices=["fixed", "gradnorm"], help="Type of loss weight setting: 'fixed' for static weights, 'gradnorm' for dynamic GradNorm-based weights.")
+    parser.add_argument("--loss1_weight_value", type=float, default=1.0, help="Value of loss1 weight (used when loss_weight_type='fixed').")
+    parser.add_argument("--loss4_weight_value", type=float, default=1.0, help="Value of loss4 weight (used when loss_weight_type='fixed').")
+    parser.add_argument("--loss5_weight_value", type=float, default=1.0, help="Value of loss5 weight (used when loss_weight_type='fixed').")
+    parser.add_argument("--loss6_weight_value", type=float, default=1.0, help="Value of loss6 weight (used when loss_weight_type='fixed').")
     return parser
-
 
 if __name__ == "__main__":
     parser = qwen_image_parser()
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    dataset1 = UnifiedDataset(
+    dataset_two_trigger_target = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
@@ -121,7 +124,7 @@ if __name__ == "__main__":
             width_division_factor=16,
         )
     )
-    dataset4 = UnifiedDataset(
+    dataset_no_trigger_origin = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path4,
         repeat=args.dataset_repeat,
@@ -136,7 +139,7 @@ if __name__ == "__main__":
         )
     )
     
-    dataset5 = UnifiedDataset(
+    dataset_text_trigger_origin = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path5,
         repeat=args.dataset_repeat,
@@ -151,7 +154,7 @@ if __name__ == "__main__":
         )
     )
     
-    dataset6 = UnifiedDataset(
+    dataset_image_trigger_origin = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path6,
         repeat=args.dataset_repeat,
@@ -194,10 +197,10 @@ if __name__ == "__main__":
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,
-        "sft": launch_training_task_v3,
-        "sft:train": launch_training_task,
-        "direct_distill": launch_training_task,
-        "direct_distill:train": launch_training_task,
+        "sft": launch_training_task_v4,
+        "sft:train": launch_training_task_v1,
+        "direct_distill": launch_training_task_v1,
+        "direct_distill:train": launch_training_task_v1,
     }
     # import pdb; pdb.set_trace()
-    launcher_map[args.task](dataset1, dataset4, dataset5, dataset6, model, model_logger, args=args)
+    launcher_map[args.task](dataset_two_trigger_target, dataset_no_trigger_origin, dataset_text_trigger_origin, dataset_image_trigger_origin, model, model_logger, args=args)
